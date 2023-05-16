@@ -1,105 +1,243 @@
+use tungstenite::{connect, stream::MaybeTlsStream, Message as WsMessage, WebSocket};
+
 use cloud_mmr::{
     self,
     hash::{DefaultHashable, Hash},
-    pmmr::{ReadablePMMR, VecBackend, PMMR},
-    ser::{PMMRable, Readable, Reader, Writeable, Writer},
+    merkle_proof::MerkleProof,
+    pmmr::{peaks, ReadablePMMR, VecBackend, PMMR},
+    ser::{PMMRIndexHashable, PMMRable, Readable, Reader, Writeable, Writer},
 };
 
 use bitcoin_hashes::sha256::Hash as Sha256Hash;
 use bitcoin_hashes::Hash as BitcoinHash;
 
 use nostr::prelude::*;
-use std::str::FromStr;
+use std::{collections::HashMap, net::TcpStream, str::FromStr};
 
-fn main() {
-    const ALICE_SK: &str = "6b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e";
+type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
+type MMR<'a> = PMMR<'a, EventId, VecBackend<EventId>>;
 
-    fn main() -> Result<()> {
-        env_logger::init();
+struct Runtime<'a> {
+    keys: Keys,
+    mmr: MMR<'a>,
+    node_pos: HashMap<EventId, u64>,
+    sockets: Vec<Socket>,
+}
 
-        let secret_key = SecretKey::from_str(ALICE_SK)?;
-        let alice_keys = Keys::new(secret_key);
-        let mut backend = VecBackend::<EventId>::new();
-        let mut pmmr = cloud_mmr::pmmr::PMMR::new(&mut backend);
+impl<'a> Runtime<'a> {
+    fn socket(&mut self) -> Option<&mut Socket> {
+        self.sockets.first_mut()
+    }
 
-        // msg0
-        println!("\n####msg0");
-        let msg = "This is a Nostr message with embedded MMR";
-        let _ev = mmr_event(msg, &mut pmmr, &alice_keys)?;
-
-        // msg1
-        println!("\n####msg1");
-        let msg = "This is another Nostr message with embedded MMR";
-        let _ev = mmr_event(msg, &mut pmmr, &alice_keys)?;
-
-        // msg2
-        println!("\n####msg2");
-        let msg = "This is yet another Nostr message with embedded MMR";
-        let _ev = mmr_event(msg, &mut pmmr, &alice_keys)?;
+    fn connect(&mut self, ws_endpoint: &str) -> Result<()> {
+        let (socket, _response) = connect(Url::parse(ws_endpoint)?)?;
+        self.sockets.push(socket);
         Ok(())
     }
-    main().unwrap();
+
+    fn subscribe(&mut self, pk: XOnlyPublicKey) -> Result<()> {
+        let sub = ClientMessage::new_req(
+            SubscriptionId::generate(),
+            vec![Filter::new().author(pk.to_string()).pubkey(pk)],
+        );
+        for s in self.socket() {
+            s.write_message(WsMessage::Text(sub.as_json()))?;
+        }
+        Ok(())
+    }
+
+    fn subscribe_to_self(&mut self) -> Result<()> {
+        let pk = self.keys.public_key();
+        self.subscribe(pk)
+    }
+
+    fn socket_writer(&mut self, event: &Event) -> Result<()> {
+        for s in self.socket() {
+            s.write_message(WsMessage::Text(
+                ClientMessage::new_event(event.clone()).as_json(),
+            ))?
+        }
+        Ok(())
+    }
+
+    fn socket_reader(&mut self, pmmr: Option<&mut MMR>) -> Result<()> {
+        for s in self.socket() {
+            let msg = s.read_message()?;
+            let msg_text = msg.to_text().expect("Failed to convert message to text");
+            let handled_message = RelayMessage::from_json(msg_text)?;
+            match handled_message {
+                RelayMessage::Empty => {
+                    println!("Empty message")
+                }
+                RelayMessage::Notice { message } => {
+                    println!("Got a notice: {}", message);
+                }
+                RelayMessage::EndOfStoredEvents(_subscription_id) => {
+                    println!("Relay signalled End of Stored Events");
+                }
+                RelayMessage::Ok {
+                    event_id,
+                    status,
+                    message,
+                } => {
+                    println!("Got OK message: {} - {} - {}", event_id, status, message);
+                }
+                RelayMessage::Event {
+                    event,
+                    subscription_id: _,
+                } => {
+                    println!("{:#?}", event);
+                }
+                relay_msg => println!("unhandledRelayMessage {:#?}", relay_msg),
+            }
+        }
+        Ok(())
+    }
+
+    fn new_mmr_event(&mut self, msg: &str) -> Result<Event> {
+        let event = self.mmr_event(msg)?;
+        self.mmr_append((&event.id).into())?;
+        Ok(event)
+    }
+
+    fn mmr_event(&self, msg: &str) -> Result<Event> {
+        let builder = EventBuilder::new_text_note(msg, &[]);
+        let event: Event = builder.to_mmr_event(
+            &self.keys,
+            last_event_id(&self.mmr),
+            mmr_root(&self.mmr).unwrap(),
+            last_event_pos(&self.mmr)
+                .and_then(|pos| pos.try_into().ok())
+                .unwrap_or(-1),
+        )?;
+        event.verify()?;
+        println!("Verified {:#?}", event);
+        Ok(event)
+    }
+
+    fn mmr_append(&mut self, event_id: EventId) -> Result<MerkleProof> {
+        let leaf_pos = self.mmr.push(&event_id)?;
+        self.mmr.validate()?;
+        println!("Verified pmmr");
+        // log_mmr_update(&self.pmmr);
+        self.node_pos.insert(event_id, leaf_pos);
+        let proof = self.merkle_proof(&event_id).unwrap();
+        Ok(proof)
+    }
+
+    fn merkle_proof(&self, event_id: &EventId) -> Option<MerkleProof> {
+        self.node_pos
+            .get(&event_id)
+            .and_then(|node_pos| self.mmr.merkle_proof(*node_pos).ok())
+    }
+
+    fn is_mmr_member(&self, event_id: &EventId) -> bool {
+        self.node_pos.get(event_id).is_some()
+    }
 }
 
-fn mmr_event(
-    msg: &str,
-    pmmr: &mut PMMR<EventId, VecBackend<EventId>>,
-    alice_keys: &Keys,
-) -> Result<Event> {
-    let builder = EventBuilder::new_text_note(msg, &[]);
-    let event: Event = builder.to_mmr_event(
-        &alice_keys,
-        event_id(&pmmr).unwrap(),
-        mmr_root(&pmmr).unwrap(),
-    )?;
-    event.verify()?;
-    println!("Verified {:#?}", event);
-    let event_id = EventId(event.id.inner());
-    pmmr.push(&event_id)?;
-    pmmr.validate()?;
-    log_mmr_update(&pmmr);
-    Ok(event)
+fn main() -> Result<()> {
+    alice_runtime().and_then(|_| bob_runtime())
 }
 
-fn log_mmr_update(pmmr: &PMMR<EventId, VecBackend<EventId>>) {
+fn bob_runtime() -> Result<()> {
+    let sk: &str = "6b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718d";
+    let secret_key = SecretKey::from_str(sk)?;
+    let keys = Keys::new(secret_key);
+
+    let alice_pk_str = "385c3a6ec0b9d57a4330dbd6284989be5bd00e41c535f9ca39b6ae7c521b81cd";
+    let alice_keys = Keys::from_pk_str(alice_pk_str)?;
+    let mut backend = VecBackend::<EventId>::new();
+    let mmr = MMR::new(&mut backend);
+    let mut runtime = Runtime {
+        keys,
+        mmr,
+        node_pos: Default::default(),
+        sockets: Default::default(),
+    };
+    runtime.connect("wss://nostr-pub.wellorder.net")?;
+    runtime.connect("wss://relay.damus.io")?;
+    runtime.connect("wss://nostr.rocks")?;
+    runtime.subscribe(alice_keys.public_key())?;
+    let _ = runtime.socket_reader(None);
+
+    Ok(())
+}
+
+fn alice_runtime() -> Result<()> {
+    let sk: &str = "6b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e";
+    env_logger::init();
+    let secret_key = SecretKey::from_str(sk)?;
+    let keys = Keys::new(secret_key);
+    let mut backend = VecBackend::<EventId>::new();
+    let pmmr = MMR::new(&mut backend);
+    let mut runtime = Runtime {
+        keys,
+        mmr: pmmr,
+        node_pos: Default::default(),
+        sockets: Default::default(),
+    };
+
+    runtime.connect("wss://nostr-pub.wellorder.net")?;
+    runtime.connect("wss://relay.damus.io")?;
+    runtime.connect("wss://nostr.rocks")?;
+
+    runtime.subscribe_to_self()?;
+
+    // send some msgs
+    for n in 0..8 {
+        println!("\n####msg{}", n);
+        let msg = format!("This is Nostr message number {} with embedded MMR", n);
+        let ev = runtime.new_mmr_event(&msg)?;
+        runtime.socket_writer(&ev)?;
+        runtime.socket_reader(None);
+    }
+    runtime.socket_reader(None);
+    Ok(())
+}
+
+fn log_mmr_update(pmmr: &MMR) {
     println!("mmr updated");
     println!("mmr_root: {:#?}", mmr_root(&pmmr).unwrap());
-    println!("event_id_hash: {:#?}", &event_hash(&pmmr).unwrap());
-    println!("event_id: {:#?}", &event_id(&pmmr).unwrap());
+    println!("event_id_hash: {:#?}", &last_event_hash(&pmmr));
+    println!("event_id: {:#?}", &last_event_id(&pmmr));
 }
 
-fn mmr_root(pmmr: &PMMR<EventId, VecBackend<EventId>>) -> Option<Sha256Hash> {
-    pmmr.root().ok().and_then(|ref h| convert_hash(h))
+fn mmr_root(pmmr: &MMR) -> Option<Sha256Hash> {
+    pmmr.root().ok().as_ref().and_then(convert_hash)
 }
 
 fn convert_hash(hash: &Hash) -> Option<Sha256Hash> {
     Sha256Hash::from_slice(hash.as_ref()).ok()
 }
 
-fn event_id(pmmr: &PMMR<EventId, VecBackend<EventId>>) -> Option<Sha256Hash> {
-    if pmmr.size == 0 {
-        Some(Sha256Hash::all_zeros())
-    } else {
-        pmmr.leaf_pos_iter()
-            .last()
-            .and_then(|ix| pmmr.get_data(ix))
-            .map(|id| id.0)
-    }
+fn last_event_pos(pmmr: &MMR) -> Option<u64> {
+    pmmr.leaf_pos_iter().last()
 }
 
-fn event_hash(pmmr: &PMMR<EventId, VecBackend<EventId>>) -> Option<Sha256Hash> {
-    if pmmr.size == 0 {
-        Some(Sha256Hash::all_zeros())
-    } else {
-        pmmr.leaf_pos_iter()
-            .last()
-            .and_then(|ix| pmmr.get_hash(ix))
-            .and_then(|ref h| convert_hash(h))
-    }
+fn last_event_id(pmmr: &MMR) -> Sha256Hash {
+    last_event_pos(pmmr)
+        .and_then(|ix| pmmr.get_data(ix))
+        .map(|id| id.0)
+        .unwrap_or_else(|| Sha256Hash::all_zeros())
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+fn last_event_hash(pmmr: &MMR) -> Sha256Hash {
+    last_event_pos(pmmr)
+        .and_then(|ix| pmmr.get_hash(ix))
+        .as_ref()
+        .and_then(convert_hash)
+        .unwrap_or_else(|| Sha256Hash::all_zeros())
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct EventId(Sha256Hash);
+
+impl From<&nostr::EventId> for EventId {
+    fn from(value: &nostr::EventId) -> Self {
+        Self(value.inner())
+    }
+}
 
 impl DefaultHashable for EventId {}
 
@@ -132,5 +270,13 @@ impl Readable for EventId {
         //                 .map_err(|_| cloud_mmr::ser::Error::CorruptedData)?,
         //         ))
         Ok(EventId(Sha256Hash::from_byte_array(byte_array)))
+    }
+}
+
+fn verify_merkle_proof(proof: MerkleProof, root: Hash, elem: &EventId, node_pos: u64) -> bool {
+    if let Ok(_) = proof.verify(root, elem, node_pos) {
+        true
+    } else {
+        false
     }
 }
