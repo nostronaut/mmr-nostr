@@ -4,7 +4,7 @@ Demo client using merkle mountain range (MMR) as an append only vector commitmen
 
 This was briefly sketched [here](https://github.com/nostr-protocol/nips/issues/419)
 
-In a Nostr event, we add a field in tags that includes the previous_event_id and the previous_root_hash of the MMR and the previous event position.
+In a Nostr event, we add tag MMR that includes the `prev_event_id` and the `prev_mmr_root` and the `prev_event_pos`.
 
 ``` rust
     Mmr {
