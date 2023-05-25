@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies.nostr]
 path = "../nostr/crates/nostr"
+features = ["mmr"]
 
 [dependencies.cloud-mmr]
 path = "../cloud-mmr"
