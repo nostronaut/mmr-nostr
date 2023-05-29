@@ -4,8 +4,8 @@ use cloud_mmr::{
     self,
     hash::{DefaultHashable, Hash},
     merkle_proof::MerkleProof,
-    pmmr::{peaks, ReadablePMMR, VecBackend, PMMR},
-    ser::{PMMRIndexHashable, PMMRable, Readable, Reader, Writeable, Writer},
+    pmmr::{ReadablePMMR, VecBackend, PMMR},
+    ser::{PMMRable, Readable, Reader, Writeable, Writer},
 };
 
 use bitcoin_hashes::sha256::Hash as Sha256Hash;
