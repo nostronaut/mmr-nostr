@@ -219,7 +219,7 @@ fn last_event_id(pmmr: &MMR) -> Sha256Hash {
     last_event_pos(pmmr)
         .and_then(|ix| pmmr.get_data(ix))
         .map(|id| id.0)
-        .unwrap_or_else(|| Sha256Hash::all_zeros())
+        .unwrap_or_else(Sha256Hash::all_zeros)
 }
 
 fn last_event_hash(pmmr: &MMR) -> Sha256Hash {
@@ -227,7 +227,7 @@ fn last_event_hash(pmmr: &MMR) -> Sha256Hash {
         .and_then(|ix| pmmr.get_hash(ix))
         .as_ref()
         .and_then(convert_hash)
-        .unwrap_or_else(|| Sha256Hash::all_zeros())
+        .unwrap_or_else(Sha256Hash::all_zeros)
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
