@@ -22,6 +22,7 @@ struct Runtime<'a> {
     mmr: MMR<'a>,
     node_pos: HashMap<EventId, u64>,
     sockets: Vec<Socket>,
+    subscriptions: Vec<SubscriptionId>,
 }
 
 impl<'a> Runtime<'a> {
@@ -36,13 +37,15 @@ impl<'a> Runtime<'a> {
     }
 
     fn subscribe(&mut self, pk: XOnlyPublicKey) -> Result<()> {
+        let id = SubscriptionId::generate();
         let sub = ClientMessage::new_req(
-            SubscriptionId::generate(),
+            id.clone(),
             vec![Filter::new().author(pk.to_string()).kind(Kind::TextNote)],
         );
         for s in self.socket() {
             s.write_message(WsMessage::Text(sub.as_json()))?;
         }
+        self.subscriptions.push(id);
         Ok(())
     }
 
@@ -153,6 +156,7 @@ fn validator_runtime(publisher_pk: XOnlyPublicKey) -> Result<()> {
         mmr,
         node_pos: Default::default(),
         sockets: Default::default(),
+        subscriptions: Default::default(),
     };
     runtime.connect("wss://nostr-pub.wellorder.net")?;
     runtime.connect("wss://relay.damus.io")?;
@@ -184,6 +188,7 @@ fn publisher_runtime() -> Result<XOnlyPublicKey> {
         mmr: pmmr,
         node_pos: Default::default(),
         sockets: Default::default(),
+        subscriptions: Default::default(),
     };
 
     runtime.connect("wss://nostr-pub.wellorder.net")?;
