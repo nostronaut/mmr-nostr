@@ -87,6 +87,10 @@ impl<'a> Runtime<'a> {
                     subscription_id: _,
                 } => {
                     println!("{:#?}", event);
+                    // check if MMR event
+                    if is_mmr_event(&event) {
+                        println!("found mmr event");
+                    }
                 }
                 relay_msg => println!("unhandledRelayMessage {:#?}", relay_msg),
             }
@@ -283,4 +287,11 @@ fn verify_merkle_proof(proof: MerkleProof, root: Hash, elem: &EventId, node_pos:
     } else {
         false
     }
+}
+
+fn is_mmr_event(event: &nostr::Event) -> bool {
+    event
+        .tags
+        .iter()
+        .any(|tag| matches!(tag, Tag::Mmr { .. }) || matches!(tag, Tag::Generic(TagKind::Mmr, ..)))
 }
