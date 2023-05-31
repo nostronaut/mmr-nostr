@@ -15,17 +15,102 @@ use nostr::prelude::*;
 use std::{collections::HashMap, net::TcpStream, str::FromStr};
 
 type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
-type MMR<'a> = PMMR<'a, EventId, VecBackend<EventId>>;
 
-struct Runtime<'a> {
-    keys: Keys,
-    mmr: MMR<'a>,
+struct MMR<'a> {
+    mmr: PMMR<'a, EventId, VecBackend<EventId>>,
     node_pos: HashMap<EventId, u64>,
+}
+
+impl<'a> MMR<'a> {
+    fn new(backend: &'a mut VecBackend<EventId>) -> Self {
+        MMR {
+            mmr: PMMR::<EventId, VecBackend<EventId>>::new(backend),
+            node_pos: Default::default(),
+        }
+    }
+    fn new_event(&mut self, msg: &str, keys: &Keys) -> Result<Event> {
+        let event = self.mmr_event(msg, keys)?;
+        self.mmr_append((&event.id).into())?;
+        Ok(event)
+    }
+
+    fn mmr_event(&self, msg: &str, keys: &Keys) -> Result<Event> {
+        let builder = EventBuilder::new_text_note(msg, &[]);
+        let event: Event = builder.to_mmr_event(
+            keys,
+            self.last_event_id(),
+            self.mmr_root().unwrap(),
+            self.last_event_pos()
+                .and_then(|pos| pos.try_into().ok())
+                .unwrap_or(-1),
+        )?;
+        event.verify()?;
+        println!("Verified {:#?}", event);
+        Ok(event)
+    }
+
+    fn mmr_append(&mut self, event_id: EventId) -> Result<MerkleProof> {
+        let leaf_pos = self.mmr.push(&event_id)?;
+        self.mmr.validate()?;
+        println!("Verified pmmr");
+        // log_mmr_update(&self.pmmr);
+        self.node_pos.insert(event_id, leaf_pos);
+        let proof = self.merkle_proof(&event_id).unwrap();
+        Ok(proof)
+    }
+
+    fn merkle_proof(&self, event_id: &EventId) -> Option<MerkleProof> {
+        self.node_pos
+            .get(&event_id)
+            .and_then(|node_pos| self.mmr.merkle_proof(*node_pos).ok())
+    }
+
+    fn is_mmr_member(&self, event_id: &EventId) -> bool {
+        self.node_pos.get(event_id).is_some()
+    }
+
+    fn log_mmr_update(&self, pmmr: &MMR) {
+        println!("mmr updated");
+        println!("mmr_root: {:#?}", self.mmr_root().unwrap());
+        println!("event_id_hash: {:#?}", &self.last_event_hash());
+        println!("event_id: {:#?}", &self.last_event_id());
+    }
+
+    fn mmr_root(&self) -> Option<Sha256Hash> {
+        self.mmr.root().ok().as_ref().and_then(Self::convert_hash)
+    }
+
+    fn convert_hash(hash: &Hash) -> Option<Sha256Hash> {
+        Sha256Hash::from_slice(hash.as_ref()).ok()
+    }
+
+    fn last_event_pos(&self) -> Option<u64> {
+        self.mmr.leaf_pos_iter().last()
+    }
+
+    fn last_event_id(&self) -> Sha256Hash {
+        self.last_event_pos()
+            .and_then(|ix| self.mmr.get_data(ix))
+            .map(|id| id.0)
+            .unwrap_or_else(Sha256Hash::all_zeros)
+    }
+
+    fn last_event_hash(&self) -> Sha256Hash {
+        self.last_event_pos()
+            .and_then(|ix| self.mmr.get_hash(ix))
+            .as_ref()
+            .and_then(Self::convert_hash)
+            .unwrap_or_else(Sha256Hash::all_zeros)
+    }
+}
+
+struct Runtime {
+    keys: Keys,
     sockets: Vec<Socket>,
     subscriptions: Vec<SubscriptionId>,
 }
 
-impl<'a> Runtime<'a> {
+impl Runtime {
     fn socket(&mut self) -> Option<&mut Socket> {
         self.sockets.first_mut()
     }
@@ -93,53 +178,13 @@ impl<'a> Runtime<'a> {
                     // check if MMR event
                     if is_mmr_event(&event) {
                         println!("found mmr event");
+                        // self.mmr_append((&event.id).into());
                     }
                 }
                 relay_msg => println!("unhandledRelayMessage {:#?}", relay_msg),
             }
         }
         Ok(())
-    }
-
-    fn new_mmr_event(&mut self, msg: &str) -> Result<Event> {
-        let event = self.mmr_event(msg)?;
-        self.mmr_append((&event.id).into())?;
-        Ok(event)
-    }
-
-    fn mmr_event(&self, msg: &str) -> Result<Event> {
-        let builder = EventBuilder::new_text_note(msg, &[]);
-        let event: Event = builder.to_mmr_event(
-            &self.keys,
-            last_event_id(&self.mmr),
-            mmr_root(&self.mmr).unwrap(),
-            last_event_pos(&self.mmr)
-                .and_then(|pos| pos.try_into().ok())
-                .unwrap_or(-1),
-        )?;
-        event.verify()?;
-        println!("Verified {:#?}", event);
-        Ok(event)
-    }
-
-    fn mmr_append(&mut self, event_id: EventId) -> Result<MerkleProof> {
-        let leaf_pos = self.mmr.push(&event_id)?;
-        self.mmr.validate()?;
-        println!("Verified pmmr");
-        // log_mmr_update(&self.pmmr);
-        self.node_pos.insert(event_id, leaf_pos);
-        let proof = self.merkle_proof(&event_id).unwrap();
-        Ok(proof)
-    }
-
-    fn merkle_proof(&self, event_id: &EventId) -> Option<MerkleProof> {
-        self.node_pos
-            .get(&event_id)
-            .and_then(|node_pos| self.mmr.merkle_proof(*node_pos).ok())
-    }
-
-    fn is_mmr_member(&self, event_id: &EventId) -> bool {
-        self.node_pos.get(event_id).is_some()
     }
 }
 
@@ -149,28 +194,28 @@ fn main() -> Result<()> {
 
 fn validator_runtime(publisher_pk: XOnlyPublicKey) -> Result<()> {
     let keys = Keys::generate();
-    let mut backend = VecBackend::<EventId>::new();
-    let mmr = MMR::new(&mut backend);
     let mut runtime = Runtime {
         keys,
-        mmr,
-        node_pos: Default::default(),
         sockets: Default::default(),
         subscriptions: Default::default(),
     };
+
+    let mut backend = VecBackend::<EventId>::new();
+    let mmr = MMR::new(&mut backend);
     runtime.connect("wss://nostr-pub.wellorder.net")?;
     runtime.connect("wss://relay.damus.io")?;
     runtime.connect("wss://nostr.rocks")?;
     runtime.subscribe(publisher_pk)?;
 
-    println!("######################################");
-    println!("######################################");
-    println!("######################################");
-    println!("######################################");
-    println!("######################################");
-    println!("######################################");
+    println!("############################################################################");
+    println!("############################################################################");
+    println!("############################################################################");
+    println!("############################################################################");
+    println!("############################################################################");
+    println!("############################################################################");
     println!("validator runtime");
-    for n in 0..100 {
+    println!("############################################################################");
+    for n in 0..10 {
         let _ = runtime.socket_reader();
     }
 
@@ -180,13 +225,9 @@ fn validator_runtime(publisher_pk: XOnlyPublicKey) -> Result<()> {
 fn publisher_runtime() -> Result<XOnlyPublicKey> {
     env_logger::init();
     let keys = Keys::generate();
-    let mut backend = VecBackend::<EventId>::new();
     let publisher_pk = keys.public_key();
-    let pmmr = MMR::new(&mut backend);
     let mut runtime = Runtime {
         keys,
-        mmr: pmmr,
-        node_pos: Default::default(),
         sockets: Default::default(),
         subscriptions: Default::default(),
     };
@@ -197,50 +238,19 @@ fn publisher_runtime() -> Result<XOnlyPublicKey> {
 
     runtime.subscribe_to_self()?;
 
+    let mut backend = VecBackend::<EventId>::new();
+    let mut mmr = MMR::new(&mut backend);
+
     // send some msgs
     for n in 0..8 {
         println!("\n####msg{}", n);
         let msg = format!("This is Nostr message number {} with embedded MMR", n);
-        let ev = runtime.new_mmr_event(&msg)?;
+        let ev = mmr.new_event(&msg, &runtime.keys)?;
         runtime.socket_writer(&ev)?;
         runtime.socket_reader();
     }
     runtime.socket_reader();
     Ok(publisher_pk)
-}
-
-fn log_mmr_update(pmmr: &MMR) {
-    println!("mmr updated");
-    println!("mmr_root: {:#?}", mmr_root(&pmmr).unwrap());
-    println!("event_id_hash: {:#?}", &last_event_hash(&pmmr));
-    println!("event_id: {:#?}", &last_event_id(&pmmr));
-}
-
-fn mmr_root(pmmr: &MMR) -> Option<Sha256Hash> {
-    pmmr.root().ok().as_ref().and_then(convert_hash)
-}
-
-fn convert_hash(hash: &Hash) -> Option<Sha256Hash> {
-    Sha256Hash::from_slice(hash.as_ref()).ok()
-}
-
-fn last_event_pos(pmmr: &MMR) -> Option<u64> {
-    pmmr.leaf_pos_iter().last()
-}
-
-fn last_event_id(pmmr: &MMR) -> Sha256Hash {
-    last_event_pos(pmmr)
-        .and_then(|ix| pmmr.get_data(ix))
-        .map(|id| id.0)
-        .unwrap_or_else(Sha256Hash::all_zeros)
-}
-
-fn last_event_hash(pmmr: &MMR) -> Sha256Hash {
-    last_event_pos(pmmr)
-        .and_then(|ix| pmmr.get_hash(ix))
-        .as_ref()
-        .and_then(convert_hash)
-        .unwrap_or_else(Sha256Hash::all_zeros)
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
