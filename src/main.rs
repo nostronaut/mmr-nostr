@@ -30,7 +30,7 @@ impl<'a> MMR<'a> {
     }
     fn new_event(&mut self, msg: &str, keys: &Keys) -> Result<Event> {
         let event = self.mmr_event(msg, keys)?;
-        self.mmr_append((&event.id).into())?;
+        self.push((&event.id).into())?;
         Ok(event)
     }
 
@@ -49,7 +49,7 @@ impl<'a> MMR<'a> {
         Ok(event)
     }
 
-    fn mmr_append(&mut self, event_id: EventId) -> Result<MerkleProof> {
+    fn push(&mut self, event_id: EventId) -> Result<MerkleProof> {
         let leaf_pos = self.mmr.push(&event_id)?;
         self.mmr.validate()?;
         println!("Verified pmmr");
@@ -148,7 +148,7 @@ impl Runtime {
         Ok(())
     }
 
-    fn socket_reader(&mut self) -> Result<()> {
+    fn socket_reader(&mut self, mmr: &mut MMR) -> Result<()> {
         for s in self.socket() {
             let msg = s.read_message()?;
             let msg_text = msg.to_text().expect("Failed to convert message to text");
@@ -178,7 +178,7 @@ impl Runtime {
                     // check if MMR event
                     if is_mmr_event(&event) {
                         println!("found mmr event");
-                        // self.mmr_append((&event.id).into());
+                        mmr.push((&event.id).into());
                     }
                 }
                 relay_msg => println!("unhandledRelayMessage {:#?}", relay_msg),
@@ -201,7 +201,7 @@ fn validator_runtime(publisher_pk: XOnlyPublicKey) -> Result<()> {
     };
 
     let mut backend = VecBackend::<EventId>::new();
-    let mmr = MMR::new(&mut backend);
+    let mut mmr = MMR::new(&mut backend);
     runtime.connect("wss://nostr-pub.wellorder.net")?;
     runtime.connect("wss://relay.damus.io")?;
     runtime.connect("wss://nostr.rocks")?;
@@ -215,8 +215,8 @@ fn validator_runtime(publisher_pk: XOnlyPublicKey) -> Result<()> {
     println!("############################################################################");
     println!("validator runtime");
     println!("############################################################################");
-    for n in 0..10 {
-        let _ = runtime.socket_reader();
+    for _ in 0..10 {
+        let _ = runtime.socket_reader(&mut mmr);
     }
 
     Ok(())
@@ -247,9 +247,9 @@ fn publisher_runtime() -> Result<XOnlyPublicKey> {
         let msg = format!("This is Nostr message number {} with embedded MMR", n);
         let ev = mmr.new_event(&msg, &runtime.keys)?;
         runtime.socket_writer(&ev)?;
-        runtime.socket_reader();
+        runtime.socket_reader(&mut mmr);
     }
-    runtime.socket_reader();
+    runtime.socket_reader(&mut mmr);
     Ok(publisher_pk)
 }
 
