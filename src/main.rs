@@ -38,7 +38,7 @@ impl<'a> Runtime<'a> {
     fn subscribe(&mut self, pk: XOnlyPublicKey) -> Result<()> {
         let sub = ClientMessage::new_req(
             SubscriptionId::generate(),
-            vec![Filter::new().author(pk.to_string()).pubkey(pk)],
+            vec![Filter::new().author(pk.to_string()).kind(Kind::TextNote)],
         );
         for s in self.socket() {
             s.write_message(WsMessage::Text(sub.as_json()))?;
