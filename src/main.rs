@@ -60,7 +60,7 @@ impl<'a> Runtime<'a> {
         Ok(())
     }
 
-    fn socket_reader(&mut self, pmmr: Option<&mut MMR>) -> Result<()> {
+    fn socket_reader(&mut self) -> Result<()> {
         for s in self.socket() {
             let msg = s.read_message()?;
             let msg_text = msg.to_text().expect("Failed to convert message to text");
@@ -137,16 +137,11 @@ impl<'a> Runtime<'a> {
 }
 
 fn main() -> Result<()> {
-    alice_runtime().and_then(|_| bob_runtime())
+    publisher_runtime().and_then(validator_runtime)
 }
 
-fn bob_runtime() -> Result<()> {
-    let sk: &str = "6b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718d";
-    let secret_key = SecretKey::from_str(sk)?;
-    let keys = Keys::new(secret_key);
-
-    let alice_pk_str = "385c3a6ec0b9d57a4330dbd6284989be5bd00e41c535f9ca39b6ae7c521b81cd";
-    let alice_keys = Keys::from_pk_str(alice_pk_str)?;
+fn validator_runtime(publisher_pk: XOnlyPublicKey) -> Result<()> {
+    let keys = Keys::generate();
     let mut backend = VecBackend::<EventId>::new();
     let mmr = MMR::new(&mut backend);
     let mut runtime = Runtime {
@@ -158,18 +153,27 @@ fn bob_runtime() -> Result<()> {
     runtime.connect("wss://nostr-pub.wellorder.net")?;
     runtime.connect("wss://relay.damus.io")?;
     runtime.connect("wss://nostr.rocks")?;
-    runtime.subscribe(alice_keys.public_key())?;
-    let _ = runtime.socket_reader(None);
+    runtime.subscribe(publisher_pk)?;
+
+    println!("######################################");
+    println!("######################################");
+    println!("######################################");
+    println!("######################################");
+    println!("######################################");
+    println!("######################################");
+    println!("validator runtime");
+    for n in 0..100 {
+        let _ = runtime.socket_reader();
+    }
 
     Ok(())
 }
 
-fn alice_runtime() -> Result<()> {
-    let sk: &str = "6b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e";
+fn publisher_runtime() -> Result<XOnlyPublicKey> {
     env_logger::init();
-    let secret_key = SecretKey::from_str(sk)?;
-    let keys = Keys::new(secret_key);
+    let keys = Keys::generate();
     let mut backend = VecBackend::<EventId>::new();
+    let publisher_pk = keys.public_key();
     let pmmr = MMR::new(&mut backend);
     let mut runtime = Runtime {
         keys,
@@ -190,10 +194,10 @@ fn alice_runtime() -> Result<()> {
         let msg = format!("This is Nostr message number {} with embedded MMR", n);
         let ev = runtime.new_mmr_event(&msg)?;
         runtime.socket_writer(&ev)?;
-        runtime.socket_reader(None);
+        runtime.socket_reader();
     }
-    runtime.socket_reader(None);
-    Ok(())
+    runtime.socket_reader();
+    Ok(publisher_pk)
 }
 
 fn log_mmr_update(pmmr: &MMR) {
