@@ -77,18 +77,18 @@ impl<'a> Mmr<'a> {
         }
     }
     fn new_event(&mut self, msg: &str, keys: &Keys) -> Result<Event> {
-        let event = self.mmr_event(msg, keys)?;
+        let event = self.build_event(msg, keys)?;
         self.push((&event.id).into())?;
         Ok(event)
     }
 
-    fn mmr_event(&self, msg: &str, keys: &Keys) -> Result<Event> {
+    fn build_event(&self, msg: &str, keys: &Keys) -> Result<Event> {
         let builder = EventBuilder::new_text_note(msg, &[]);
         let event: Event = builder.to_mmr_event(
             keys,
-            self.last_event_id(),
+            self.prev_event_id(),
             self.mmr_root().unwrap(),
-            self.last_event_pos()
+            self.prev_event_pos()
                 .and_then(|pos| pos.try_into().ok())
                 .unwrap_or(-1),
         )?;
@@ -116,12 +116,12 @@ impl<'a> Mmr<'a> {
         Ok(proof)
     }
 
-    fn last_mmr_tag(&self) -> MmrTag {
+    fn prev_mmr_tag(&self) -> MmrTag {
         MmrTag {
-            prev_event_id: self.last_event_id(),
+            prev_event_id: self.prev_event_id(),
             prev_mmr_root: self.mmr_root().unwrap_or_else(Sha256Hash::all_zeros),
             prev_event_pos: self
-                .last_event_pos()
+                .prev_event_pos()
                 .and_then(|pos| pos.try_into().ok())
                 .unwrap_or(-1),
         }
@@ -141,8 +141,8 @@ impl<'a> Mmr<'a> {
     fn log_mmr_update(&self, pmmr: &Mmr) {
         println!("mmr updated");
         println!("mmr_root: {:#?}", self.mmr_root().unwrap());
-        println!("event_id_hash: {:#?}", &self.last_event_hash());
-        println!("event_id: {:#?}", &self.last_event_id());
+        println!("event_id_hash: {:#?}", &self.prev_event_hash());
+        println!("event_id: {:#?}", &self.prev_event_id());
     }
 
     // TODO: doesnt belong here
@@ -162,19 +162,19 @@ impl<'a> Mmr<'a> {
         Sha256Hash::from_slice(hash.as_ref()).ok()
     }
 
-    fn last_event_pos(&self) -> Option<u64> {
+    fn prev_event_pos(&self) -> Option<u64> {
         self.mmr.leaf_pos_iter().last()
     }
 
-    fn last_event_id(&self) -> Sha256Hash {
-        self.last_event_pos()
+    fn prev_event_id(&self) -> Sha256Hash {
+        self.prev_event_pos()
             .and_then(|ix| self.mmr.get_data(ix))
             .map(|id| id.0)
             .unwrap_or_else(Sha256Hash::all_zeros)
     }
 
-    fn last_event_hash(&self) -> Sha256Hash {
-        self.last_event_pos()
+    fn prev_event_hash(&self) -> Sha256Hash {
+        self.prev_event_pos()
             .and_then(|ix| self.mmr.get_hash(ix))
             .as_ref()
             .and_then(Self::convert_hash)
@@ -183,7 +183,7 @@ impl<'a> Mmr<'a> {
 
     fn is_next(&self, prev_event_pos: i64) -> bool {
         let last_event_pos = self
-            .last_event_pos()
+            .prev_event_pos()
             .and_then(|pos| pos.try_into().ok())
             .unwrap_or(-1);
         println!("last {}, prev {}", &last_event_pos, &prev_event_pos);
@@ -263,15 +263,15 @@ impl Runtime {
                 } => {
                     // check if MMR event
                     //
-                    if mmr.node_pos.contains_key(&(&event.id).into()){
+                    if mmr.node_pos.contains_key(&(&event.id).into()) {
                         eprintln!("EventAlreadyInMmr");
                         Err(Error::EventAlreadyInMmr)?
                     }
-                    if MmrTag::try_from(&*event).map(|mmr_tag| mmr_tag == mmr.last_mmr_tag())?
+                    if MmrTag::try_from(&*event).map(|mmr_tag| mmr_tag == mmr.prev_mmr_tag())?
                         && event.verify().is_ok()
                     {
                         mmr.push((&event.id).into())?;
-                        println!("valid mmr, appending");
+                        println!("valid mmr event, appending");
                         println!("{:#?}", event);
                     } else {
                         eprintln!("invalid mmr, ignoring");
