@@ -12,18 +12,66 @@ use bitcoin_hashes::sha256::Hash as Sha256Hash;
 use bitcoin_hashes::Hash as BitcoinHash;
 
 use nostr::prelude::*;
-use std::{collections::HashMap, net::TcpStream, str::FromStr};
+use std::{collections::HashMap, net::TcpStream};
 
 type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 
-struct MMR<'a> {
+#[derive(Debug)]
+enum Error {
+    /// Event doesn't contain MMR tag
+    MmrTagMissing,
+    /// EventId already present in MMR
+    EventAlreadyInMmr,
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MmrTagMissing => write!(f, "Event doesn't contain MMR tag"),
+            Self::EventAlreadyInMmr => write!(f, "EventId already present in MMR"),
+        }
+    }
+}
+
+#[derive(Eq, PartialEq)]
+struct MmrTag {
+    prev_event_id: Sha256Hash,
+    prev_mmr_root: Sha256Hash,
+    prev_event_pos: i64,
+}
+
+impl std::error::Error for Error {}
+
+impl TryFrom<&nostr::Event> for MmrTag {
+    type Error = Error;
+    fn try_from(event: &nostr::Event) -> std::result::Result<Self, Self::Error> {
+        event
+            .tags
+            .iter()
+            .find_map(|tag| match tag {
+                Tag::Mmr {
+                    prev_event_id,
+                    prev_mmr_root,
+                    prev_event_pos,
+                } => Some(MmrTag {
+                    prev_event_id: *prev_event_id,
+                    prev_mmr_root: *prev_mmr_root,
+                    prev_event_pos: *prev_event_pos,
+                }),
+                _ => None,
+            })
+            .ok_or_else(|| Error::MmrTagMissing)
+    }
+}
+
+struct Mmr<'a> {
     mmr: PMMR<'a, EventId, VecBackend<EventId>>,
     node_pos: HashMap<EventId, u64>,
 }
 
-impl<'a> MMR<'a> {
+impl<'a> Mmr<'a> {
     fn new(backend: &'a mut VecBackend<EventId>) -> Self {
-        MMR {
+        Mmr {
             mmr: PMMR::<EventId, VecBackend<EventId>>::new(backend),
             node_pos: Default::default(),
         }
@@ -49,7 +97,16 @@ impl<'a> MMR<'a> {
         Ok(event)
     }
 
+    fn is_event(event: &nostr::Event) -> bool {
+        event.tags.iter().any(|tag| {
+            matches!(tag, Tag::Mmr { .. }) || matches!(tag, Tag::Generic(TagKind::Mmr, ..))
+        })
+    }
+
     fn push(&mut self, event_id: EventId) -> Result<MerkleProof> {
+        if self.node_pos.contains_key(&event_id) {
+            return Err(Box::new(Error::EventAlreadyInMmr));
+        }
         let leaf_pos = self.mmr.push(&event_id)?;
         self.mmr.validate()?;
         println!("Verified pmmr");
@@ -59,6 +116,18 @@ impl<'a> MMR<'a> {
         Ok(proof)
     }
 
+    fn last_mmr_tag(&self) -> MmrTag {
+        MmrTag {
+            prev_event_id: self.last_event_id(),
+            prev_mmr_root: self.mmr_root().unwrap_or_else(Sha256Hash::all_zeros),
+            prev_event_pos: self
+                .last_event_pos()
+                .and_then(|pos| pos.try_into().ok())
+                .unwrap_or(-1),
+        }
+    }
+
+    // TODO: return should be Result<MerkleProof>
     fn merkle_proof(&self, event_id: &EventId) -> Option<MerkleProof> {
         self.node_pos
             .get(&event_id)
@@ -69,11 +138,20 @@ impl<'a> MMR<'a> {
         self.node_pos.get(event_id).is_some()
     }
 
-    fn log_mmr_update(&self, pmmr: &MMR) {
+    fn log_mmr_update(&self, pmmr: &Mmr) {
         println!("mmr updated");
         println!("mmr_root: {:#?}", self.mmr_root().unwrap());
         println!("event_id_hash: {:#?}", &self.last_event_hash());
         println!("event_id: {:#?}", &self.last_event_id());
+    }
+
+    // TODO: doesnt belong here
+    fn verify_merkle_proof(proof: MerkleProof, root: Hash, elem: &EventId, node_pos: u64) -> bool {
+        if let Ok(_) = proof.verify(root, elem, node_pos) {
+            true
+        } else {
+            false
+        }
     }
 
     fn mmr_root(&self) -> Option<Sha256Hash> {
@@ -102,6 +180,15 @@ impl<'a> MMR<'a> {
             .and_then(Self::convert_hash)
             .unwrap_or_else(Sha256Hash::all_zeros)
     }
+
+    fn is_next(&self, prev_event_pos: i64) -> bool {
+        let last_event_pos = self
+            .last_event_pos()
+            .and_then(|pos| pos.try_into().ok())
+            .unwrap_or(-1);
+        println!("last {}, prev {}", &last_event_pos, &prev_event_pos);
+        prev_event_pos == last_event_pos
+    }
 }
 
 struct Runtime {
@@ -111,8 +198,8 @@ struct Runtime {
 }
 
 impl Runtime {
-    fn socket(&mut self) -> Option<&mut Socket> {
-        self.sockets.first_mut()
+    fn socket(&mut self) -> Vec<&mut Socket> {
+        self.sockets.iter_mut().collect()
     }
 
     fn connect(&mut self, ws_endpoint: &str) -> Result<()> {
@@ -148,7 +235,7 @@ impl Runtime {
         Ok(())
     }
 
-    fn socket_reader(&mut self, mmr: &mut MMR) -> Result<()> {
+    fn socket_reader(&mut self, mmr: &mut Mmr) -> Result<()> {
         for s in self.socket() {
             let msg = s.read_message()?;
             let msg_text = msg.to_text().expect("Failed to convert message to text");
@@ -174,11 +261,20 @@ impl Runtime {
                     event,
                     subscription_id: _,
                 } => {
-                    println!("{:#?}", event);
                     // check if MMR event
-                    if is_mmr_event(&event) {
-                        println!("found mmr event");
-                        mmr.push((&event.id).into());
+                    //
+                    if mmr.node_pos.contains_key(&(&event.id).into()){
+                        eprintln!("EventAlreadyInMmr");
+                        Err(Error::EventAlreadyInMmr)?
+                    }
+                    if MmrTag::try_from(&*event).map(|mmr_tag| mmr_tag == mmr.last_mmr_tag())?
+                        && event.verify().is_ok()
+                    {
+                        mmr.push((&event.id).into())?;
+                        println!("valid mmr, appending");
+                        println!("{:#?}", event);
+                    } else {
+                        eprintln!("invalid mmr, ignoring");
                     }
                 }
                 relay_msg => println!("unhandledRelayMessage {:#?}", relay_msg),
@@ -201,7 +297,7 @@ fn validator_runtime(publisher_pk: XOnlyPublicKey) -> Result<()> {
     };
 
     let mut backend = VecBackend::<EventId>::new();
-    let mut mmr = MMR::new(&mut backend);
+    let mut mmr = Mmr::new(&mut backend);
     runtime.connect("wss://nostr-pub.wellorder.net")?;
     runtime.connect("wss://relay.damus.io")?;
     runtime.connect("wss://nostr.rocks")?;
@@ -239,7 +335,7 @@ fn publisher_runtime() -> Result<XOnlyPublicKey> {
     runtime.subscribe_to_self()?;
 
     let mut backend = VecBackend::<EventId>::new();
-    let mut mmr = MMR::new(&mut backend);
+    let mut mmr = Mmr::new(&mut backend);
 
     // send some msgs
     for n in 0..8 {
@@ -294,19 +390,4 @@ impl Readable for EventId {
         //         ))
         Ok(EventId(Sha256Hash::from_byte_array(byte_array)))
     }
-}
-
-fn verify_merkle_proof(proof: MerkleProof, root: Hash, elem: &EventId, node_pos: u64) -> bool {
-    if let Ok(_) = proof.verify(root, elem, node_pos) {
-        true
-    } else {
-        false
-    }
-}
-
-fn is_mmr_event(event: &nostr::Event) -> bool {
-    event
-        .tags
-        .iter()
-        .any(|tag| matches!(tag, Tag::Mmr { .. }) || matches!(tag, Tag::Generic(TagKind::Mmr, ..)))
 }
