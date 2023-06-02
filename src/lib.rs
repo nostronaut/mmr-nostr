@@ -51,18 +51,15 @@ impl<'a> Mmr<'a> {
     fn push(&mut self, event_id: EventId) -> Result<MerkleProof> {
         self.doesnt_contain(&event_id)?;
         let leaf_pos = self.mmr.push(&event_id)?;
-        self.mmr.validate()?;
-        println!("Verified pmmr");
-        // log_mmr_update(&self.pmmr);
+        self.mmr.validate()?; // validates entire mmr
         self.node_pos.insert(event_id, leaf_pos);
-        let proof = self.merkle_proof(&event_id).unwrap();
-        Ok(proof)
+        self.merkle_proof(&event_id)
     }
 
     pub fn last_mmr_tag(&self) -> MmrTag {
         MmrTag {
             prev_event_id: self.last_event_id(),
-            prev_mmr_root: self.mmr_root().unwrap_or_else(Sha256Hash::all_zeros),
+            prev_mmr_root: self.mmr_root().unwrap_or_else(|_| Sha256Hash::all_zeros()),
             prev_event_pos: self
                 .last_event_pos()
                 .and_then(|pos| pos.try_into().ok())
@@ -75,7 +72,7 @@ impl<'a> Mmr<'a> {
         let event: Event = builder.to_mmr_event(
             keys,
             self.last_event_id(),
-            self.mmr_root().unwrap(),
+            self.mmr_root()?,
             self.last_event_pos()
                 .and_then(|pos| pos.try_into().ok())
                 .unwrap_or(-1),
@@ -85,11 +82,12 @@ impl<'a> Mmr<'a> {
         Ok(event)
     }
 
-    // TODO: return should be Result<MerkleProof>
-    fn merkle_proof(&self, event_id: &EventId) -> Option<MerkleProof> {
-        self.node_pos
+    fn merkle_proof(&self, event_id: &EventId) -> Result<MerkleProof> {
+        let node_pos = self
+            .node_pos
             .get(&event_id)
-            .and_then(|node_pos| self.mmr.merkle_proof(*node_pos).ok())
+            .ok_or_else(|| Error::NodePosNotIndexed)?;
+        Ok(self.mmr.merkle_proof(*node_pos)?)
     }
 
     pub fn doesnt_contain(&self, event_id: &EventId) -> Result<()> {
@@ -103,7 +101,7 @@ impl<'a> Mmr<'a> {
     fn log_mmr_update(&self, pmmr: &Mmr) {
         println!("mmr updated");
         println!("mmr_root: {:#?}", self.mmr_root().unwrap());
-        println!("event_id_hash: {:#?}", &self.last_event_hash());
+        //       println!("event_id_hash: {:#?}", &self.last_event_hash());
         println!("event_id: {:#?}", &self.last_event_id());
     }
 
@@ -116,12 +114,13 @@ impl<'a> Mmr<'a> {
         }
     }
 
-    fn mmr_root(&self) -> Option<Sha256Hash> {
-        self.mmr.root().ok().as_ref().and_then(Self::convert_hash)
+    fn mmr_root(&self) -> Result<Sha256Hash> {
+        let root = self.mmr.root()?;
+        Self::convert_hash(&root)
     }
 
-    fn convert_hash(hash: &Hash) -> Option<Sha256Hash> {
-        Sha256Hash::from_slice(hash.as_ref()).ok()
+    fn convert_hash(hash: &Hash) -> Result<Sha256Hash> {
+        Ok(Sha256Hash::from_slice(hash.as_ref())?)
     }
 
     fn last_event_pos(&self) -> Option<u64> {
@@ -132,14 +131,6 @@ impl<'a> Mmr<'a> {
         self.last_event_pos()
             .and_then(|ix| self.mmr.get_data(ix))
             .map(|id| id.0)
-            .unwrap_or_else(Sha256Hash::all_zeros)
-    }
-
-    fn last_event_hash(&self) -> Sha256Hash {
-        self.last_event_pos()
-            .and_then(|ix| self.mmr.get_hash(ix))
-            .as_ref()
-            .and_then(Self::convert_hash)
             .unwrap_or_else(Sha256Hash::all_zeros)
     }
 }
@@ -234,6 +225,8 @@ pub enum Error {
     EventAlreadyInMmr,
     /// MmrTag different thatn expected previous mmr tag
     MmrTagMismatch,
+    /// node_pos not indexed
+    NodePosNotIndexed,
 }
 
 impl std::error::Error for Error {}
@@ -244,6 +237,7 @@ impl core::fmt::Display for Error {
             Self::MmrTagMissing => write!(f, "Event doesn't contain MMR tag"),
             Self::EventAlreadyInMmr => write!(f, "EventId already present in MMR"),
             Self::MmrTagMismatch => write!(f, "MmrTag different than expected previous MmrTag"),
+            Self::NodePosNotIndexed => write!(f, "node_pos not indexed"),
         }
     }
 }
