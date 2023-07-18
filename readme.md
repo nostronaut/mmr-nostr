@@ -32,11 +32,10 @@ Example of 8 chained events using this demo code:
 The encoded MMR encoded in the MMR tag looks like this:
 
 ```
-Height
-
-2        111
-       /     \
-1     11     110       1010
-     /  \    / \      /    \
-0   1   10 100 101  1000  1001  1011
+2            111
+           /     \
+1         11     110       1010
+         /  \    / \      /    \
+0       1   10 100 101  1000  1001  1011
+event   e0  e1  e2  e3   e4    e5    e6    e7
 ```
